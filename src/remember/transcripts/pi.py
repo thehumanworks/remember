@@ -1,4 +1,11 @@
-"""Pi sessions: ~/.pi/agent/sessions/<project>/<timestamp>_<id>.jsonl."""
+"""Pi sessions: ~/.pi/agent/sessions/<project>/<timestamp>_<id>.jsonl.
+
+Messages come from "message" events. Pi saves the system prompt in a system
+message's "sections", not in its content. Compaction and branch summaries,
+and messages that extensions add ("custom_message"), are context. Other
+events, such as model changes, labels and extension state, have no text for
+the conversation and are left out.
+"""
 
 import os
 import sys
@@ -7,6 +14,7 @@ from pathlib import Path
 from typing import Final, Literal
 
 from .base import (
+    SYSTEM,
     TOOL_RESULT,
     Message,
     OnInvalid,
@@ -116,7 +124,8 @@ def get_session_transcript(
 def get_message_parts(message: dict) -> tuple[Part, ...]:
     """A Pi message's content as parts, led by the tool name for tool results."""
     parts = []
-    if message.get("role") == TOOL_RESULT:
+    role = message.get("role")
+    if role == TOOL_RESULT:
         parts.append(
             Part(
                 "tool_result",
@@ -124,6 +133,14 @@ def get_message_parts(message: dict) -> tuple[Part, ...]:
                 is_error=bool(message.get("isError")),
             )
         )
+    if role == "bashExecution":
+        return _command_parts(message)
+    sections = message.get("sections")
+    if isinstance(sections, dict):
+        prompt = "\n\n".join(
+            text for text in sections.values() if isinstance(text, str) and text.strip()
+        )
+        parts.append(Part("context", prompt, name="system prompt"))
     content = message.get("content")
     if isinstance(content, str):
         parts.append(Part("text", content))
@@ -154,10 +171,37 @@ def get_message_text(message: dict, full: bool = False) -> str:
     """Render a message's content as readable text.
 
     By default only text and images are shown, so a message that only calls
-    tools renders as an empty string. full also shows thinking, tool calls and
-    which tool a result came from.
+    tools renders as an empty string. full also shows thinking, tool calls,
+    which tool a result came from, and system prompts.
     """
     return render(get_message_parts(message), full)
+
+
+def _command_parts(message: dict) -> tuple[Part, ...]:
+    """A command that the user ran with "!", and its output."""
+    parts = [Part("text", f"$ {message.get('command', '')}")]
+    if output := message.get("output"):
+        parts.append(Part("text", str(output)))
+    if message.get("cancelled"):
+        parts.append(Part("text", "(cancelled)"))
+    elif message.get("exitCode") not in (0, None):
+        parts.append(Part("text", f"(exit code {message['exitCode']})"))
+    return tuple(parts)
+
+
+def _context_parts(content: object, name: str) -> tuple[Part, ...]:
+    """Text or content blocks that Pi or an extension added, as context."""
+    if isinstance(content, str):
+        return (Part("context", content, name=name),) if content.strip() else ()
+    parts = []
+    for block in content if isinstance(content, list) else []:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "text":
+            parts.append(Part("context", str(block.get("text", "")), name=name))
+        elif block.get("type") == "image":
+            parts.append(Part("image"))
+    return tuple(parts)
 
 
 # TranscriptSource
@@ -233,13 +277,32 @@ def _load_session(path: Path) -> SessionInfo:
 def _messages(path: Path, on_invalid: OnInvalid | None) -> Generator[Message]:
     with path.open(encoding="utf-8") as source:
         for _, event in read_records(source, path, on_invalid):
-            message = event.get("message")
-            if event.get("type") != "message" or not isinstance(message, dict):
-                continue
+            role, parts = SYSTEM, tuple[Part, ...]()
+            match event.get("type"):
+                case "message" if isinstance(message := event.get("message"), dict):
+                    role, parts = str(message.get("role")), get_message_parts(message)
+                case "compaction":
+                    # Pi saves the system prompt in force with the summary.
+                    prompt = event.get("systemMessage")
+                    parts = (
+                        *_context_parts(event.get("summary"), "compaction summary"),
+                        *(
+                            get_message_parts(prompt)
+                            if isinstance(prompt, dict)
+                            else ()
+                        ),
+                    )
+                case "branch_summary":
+                    parts = _context_parts(event.get("summary"), "branch summary")
+                case "custom_message":
+                    name = str(event.get("customType") or "extension message")
+                    parts = _context_parts(event.get("content"), name)
+                case _:
+                    continue
             yield Message(
                 id=str(event.get("id", "")),
-                role=str(message.get("role")),
-                parts=get_message_parts(message),
+                role=role,
+                parts=parts,
                 time=parse_timestamp(event.get("timestamp")),
             )
 

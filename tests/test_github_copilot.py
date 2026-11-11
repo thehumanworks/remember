@@ -5,7 +5,16 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from fixtures import ANSWER, CHECKING, FILE_TEXT, QUESTION, THINKING, copilot_session
+from fixtures import (
+    ANSWER,
+    CHECKING,
+    FILE_TEXT,
+    QUESTION,
+    SUMMARY,
+    SYSTEM_PROMPT,
+    THINKING,
+    copilot_session,
+)
 
 from remember.transcripts import github_copilot
 
@@ -65,22 +74,46 @@ class CopilotTests(unittest.TestCase):
             [
                 # What the user typed, without the context Copilot adds.
                 ("user", QUESTION),
-                ("system", "You are the GitHub Copilot CLI."),
+                ("system", ""),
                 ("assistant", ""),
                 ("assistant", CHECKING),
                 ("toolResult", FILE_TEXT),
                 ("assistant", ANSWER),
-            ],
-        )
-        self.assertEqual(
-            [message.text(full=True) for message in messages[2:5]],
-            [
-                f"(thinking) {THINKING}",
-                f'{CHECKING}\n\n(tool call: view) {{"path": "flake.nix"}}',
-                f"(tool result: view)\n\n{FILE_TEXT}",
+                ("system", ""),
+                ("system", ""),
             ],
         )
         self.assertEqual(messages[0].id, "07b40003-0000-4000-8000-000000000000")
+
+    def test_full_view_shows_every_event_with_text(self):
+        self.assertEqual(
+            [message.text(full=True) for message in self.messages()],
+            [
+                f"{QUESTION}\n\n(added context) <current_datetime>now</current_datetime>",
+                f"(system prompt) {SYSTEM_PROMPT}",
+                # The message repeats this reasoning; it is shown once.
+                f"(thinking) {THINKING}",
+                f'{CHECKING}\n\n(tool call: view) {{"path": "flake.nix"}}',
+                f"(tool result: view)\n\n{FILE_TEXT}",
+                ANSWER,
+                f"(compaction summary) {SUMMARY}",
+                "(skill nix) Use nix flake check.",
+            ],
+        )
+
+    def test_reasoning_only_in_the_message_is_shown(self):
+        text = self.path.read_text(encoding="utf-8")
+        lines = [
+            line
+            for line in text.splitlines(keepends=True)
+            if '"assistant.reasoning"' not in line
+        ]
+        self.path.write_text("".join(lines), encoding="utf-8")
+        self.assertEqual(
+            self.messages()[2].text(full=True),
+            f"(thinking) {THINKING}\n\n{CHECKING}\n\n"
+            '(tool call: view) {"path": "flake.nix"}',
+        )
 
     def test_failed_tools_show_their_error(self):
         with self.path.open("a", encoding="utf-8") as events:

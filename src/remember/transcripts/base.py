@@ -9,6 +9,12 @@ TranscriptSource at module level, so the module itself satisfies the protocol
 Sources turn their own records into Message objects made of Part objects.
 Rendering is shared, so every source prints thinking, tool calls and tool
 results in the same way.
+
+The full view must show everything a transcript records as text: messages,
+thinking, tool calls and results, system prompts, and the context and notices
+that the agent added. A source leaves out only records with no text, such as
+token counts and settings, and streaming fragments that a later record repeats
+in full. Each source lists what it leaves out in its module docstring.
 """
 
 import json
@@ -46,13 +52,15 @@ class SessionInfo:
 class Part:
     """One piece of a message.
 
-    kind is "text", "image", "thinking", "tool_call", "tool_result", or a
-    source's own block type, which is shown by name in the full view.
+    kind is "text", "image", "thinking", "tool_call", "tool_result",
+    "context", or a source's own block type, which is shown by name in the
+    full view. "context" is text that the agent added to the conversation,
+    such as a system prompt or a compaction summary; name says what it is.
     """
 
     kind: str
     text: str = ""
-    # Tool name, for tool calls and tool results.
+    # Tool name for tool calls and tool results; what the text is, for context.
     name: str = ""
     # Tool call arguments: a JSON value, or text when the tool takes text.
     arguments: object = None
@@ -126,7 +134,8 @@ def render(parts: Iterable[Part], full: bool = False) -> str:
     """Render parts as readable text.
 
     By default only text and images are shown. full also shows thinking,
-    tool calls, which tool a result came from, and other block types by name.
+    tool calls, which tool a result came from, added context, and other block
+    types by name.
     """
     return "\n\n".join(text for part in parts if (text := render_part(part, full)))
 
@@ -139,8 +148,10 @@ def render_part(part: Part, full: bool) -> str:
             return "(image)"
         case _ if not full:
             return ""
-        case "thinking":
-            return f"(thinking) {part.text.strip()}"
+        case "thinking" | "context":
+            # Encrypted or redacted thinking has no text, but it happened.
+            label = "thinking" if part.kind == "thinking" else part.name
+            return f"({label}) {part.text.strip()}".rstrip()
         case "tool_call":
             arguments = part.arguments
             if not isinstance(arguments, str):

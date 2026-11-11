@@ -12,6 +12,7 @@ from unittest.mock import patch
 import fixtures
 from remember import cli
 from remember.transcripts import claude_code, codex, github_copilot, pi
+from remember.transcripts.base import Message, Part
 
 PROJECT = "/work/remember"
 OTHER_PROJECT = "/work/other"
@@ -57,6 +58,32 @@ class ParserTests(unittest.TestCase):
         self.assertIsNone(args.since)
         self.assertIsNone(args.until)
         self.assertFalse(args.include_current)
+
+    def test_output_options_for_every_command(self):
+        for command in (["sessions"], ["search", "polars"], ["read", "pi:01a1ac0c"]):
+            self.assertEqual(self.parse(*command).format, "text")
+            for flags in (["--json"], ["--format", "json"], ["--format=json"]):
+                for argv in (flags + command, command + flags):
+                    with self.subTest(argv=argv):
+                        self.assertEqual(self.parse(*argv).format, "json")
+            self.assertEqual(self.parse(*command, "--format", "text").format, "text")
+
+    def test_last_output_option_wins(self):
+        for flags, expected in (
+            (["--json", "sessions", "--format", "text"], "text"),
+            (["--format", "text", "sessions", "--json"], "json"),
+            (["sessions", "--json", "--format=json"], "json"),
+            (["sessions", "--format", "json", "--format", "text"], "text"),
+        ):
+            with self.subTest(flags=flags):
+                self.assertEqual(self.parse(*flags).format, expected)
+
+    def test_output_formats_are_validated(self):
+        self.assert_usage_error(
+            "sessions", "--format", "yaml", message="invalid choice"
+        )
+        self.assert_usage_error("sessions", "--format", message="expected one argument")
+        self.assert_usage_error("sessions", "--js", message="unrecognized arguments")
 
     def test_search_options(self):
         args = self.parse(
@@ -242,6 +269,8 @@ class ParserTests(unittest.TestCase):
                 self.assertEqual(raised.exception.code, 0)
                 self.assertIn("pi:01a1ac0c/9c3d2e10", stdout.getvalue())
                 self.assertNotIn("\x1b[", stdout.getvalue())
+                self.assertIn("--json", stdout.getvalue())
+                self.assertIn("--format", stdout.getvalue())
 
 
 class ShortIdTests(unittest.TestCase):
@@ -425,6 +454,364 @@ class CommandTests(unittest.TestCase):
         self.assertIn(message, stderr)
         return stderr
 
+    # JSON output
+
+    def run_json(self, *argv, expected_code=0):
+        code, stdout, stderr = self.run_cli(*argv)
+        self.assertEqual((code, stderr), (expected_code, ""))
+        # json.loads rejects extra output before or after the single document.
+        result = json.loads(stdout)
+        self.assertIn("warnings", result)
+        return result
+
+    def test_every_command_supports_both_json_options(self):
+        for command in (
+            ["sessions", "--project", PROJECT],
+            ["search", "polars", "--project", PROJECT],
+            ["read", "pi:01a1ac0c"],
+        ):
+            expected = self.run_json(*command, "--json")
+            for flags in (["--json"], ["--format", "json"], ["--format=json"]):
+                for argv in (flags + command, command + flags):
+                    with self.subTest(argv=argv):
+                        self.assertEqual(self.run_json(*argv), expected)
+
+    def test_explicit_text_format_preserves_default_output(self):
+        for command in (
+            ["sessions", "--project", PROJECT],
+            ["search", "polars", "--project", PROJECT],
+            ["read", "pi:01a1ac0c"],
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(
+                    self.run_cli(*command), self.run_cli(*command, "--format", "text")
+                )
+                self.assertEqual(
+                    self.run_cli(*command),
+                    self.run_cli("--json", *command, "--format", "text"),
+                )
+
+    def test_json_sessions_include_metadata_and_totals(self):
+        result = self.run_json(
+            "sessions", "--project", PROJECT, "--limit", "1", "--json"
+        )
+        self.assertEqual(
+            result,
+            {
+                "sessions": [
+                    {
+                        "ref": "pi:01a1ca88-0",
+                        "id": NEW_ID,
+                        "source": "pi",
+                        "cwd": PROJECT,
+                        "start": "2026-11-11T12:14:00+00:00",
+                        "end": "2026-11-11T12:16:00+00:00",
+                        "request": "Define the CLI usage.",
+                    }
+                ],
+                "total": 2,
+                "limit": 1,
+                "warnings": [],
+            },
+        )
+
+    def test_json_sessions_keep_unabridged_requests(self):
+        request = 'A long request with "quotes", Unicode café and a newline.\n' * 10
+        self.write_session(
+            PROJECT,
+            NEW_ID,
+            datetime(2026, 11, 11, 12, 14),
+            [{"role": "user", "content": text(request)}],
+        )
+        result = self.run_json("sessions", "--project", PROJECT, "--json")
+        self.assertEqual(result["sessions"][0]["request"], request.strip())
+
+    def test_json_sessions_apply_scope_filters(self):
+        self.write_other_agents()
+        result = self.run_json(
+            "sessions", "--all-projects", "--source", "codex", "--json"
+        )
+        self.assertEqual(result["total"], 1)
+        self.assertEqual(result["sessions"][0]["source"], "codex")
+        result = self.run_json(
+            "sessions",
+            "--project",
+            PROJECT,
+            "--include-current",
+            "--since",
+            "2026-11-11T14:00Z",
+            "--json",
+        )
+        self.assertEqual(
+            [session["id"] for session in result["sessions"]], [CURRENT_ID]
+        )
+
+    def test_json_empty_results_are_structured(self):
+        sessions = self.run_json("sessions", "--project", "/work/none", "--json")
+        self.assertEqual(
+            sessions, {"sessions": [], "total": 0, "limit": 10, "warnings": []}
+        )
+        search = self.run_json("search", "nowhere", "--all-projects", "--json")
+        self.assertEqual(
+            search,
+            {
+                "sessions": [],
+                "total_matches": 0,
+                "total_sessions": 0,
+                "limit": 20,
+                "warnings": [],
+            },
+        )
+        read = self.run_json("read", "pi:01a1b000", "--json")
+        self.assertEqual(read["messages"], [])
+        self.assertEqual(
+            read["pagination"],
+            {
+                "total": 0,
+                "start": None,
+                "end": None,
+                "earlier_ref": None,
+                "later_ref": None,
+            },
+        )
+
+    def test_json_search_groups_messages_and_counts_before_limit(self):
+        result = self.run_json(
+            "search", "polars", "--all-projects", "--limit", "2", "--json"
+        )
+        self.assertEqual(result["total_matches"], 4)
+        self.assertEqual(result["total_sessions"], 2)
+        self.assertEqual(result["limit"], 2)
+        self.assertEqual(
+            [session["ref"] for session in result["sessions"]],
+            ["pi:019f0000", "pi:01a1ac0c"],
+        )
+        self.assertEqual(
+            [len(session["matches"]) for session in result["sessions"]], [1, 1]
+        )
+        self.assertEqual(
+            result["sessions"][1]["matches"][0],
+            {
+                "ref": "pi:01a1ac0c/ac0c0002",
+                "id": "ac0c0002",
+                "role": "user",
+                "time": "2026-11-05T14:12:00+00:00",
+                "text": QUESTION,
+                "truncated": False,
+                "total_chars": len(QUESTION),
+            },
+        )
+        result = self.run_json(
+            "search", "polars", "--all-projects", "--limit", "1", "--json"
+        )
+        self.assertEqual(len(result["sessions"]), 1)
+        self.assertEqual(result["total_matches"], 4)
+        self.assertEqual(result["total_sessions"], 2)
+
+    def test_json_search_returns_full_text_not_snippets(self):
+        message = "Prefix " * 100 + 'polars\n"quoted" café' + " suffix" * 100
+        self.write_session(
+            PROJECT,
+            NEW_ID,
+            datetime(2026, 11, 11, 12, 14),
+            [{"role": "user", "content": text(message)}],
+        )
+        result = self.run_json("search", "polars", "--project", PROJECT, "--json")
+        self.assertEqual(result["sessions"][0]["matches"][0]["text"], message)
+
+    def test_json_search_respects_role_and_full_view(self):
+        result = self.run_json(
+            "search", "polars", "--project", PROJECT, "--role", "user", "--json"
+        )
+        self.assertEqual(result["total_matches"], 1)
+        self.assertEqual(result["sessions"][0]["matches"][0]["role"], "user")
+        result = self.run_json(
+            "search", "import polars", "--project", PROJECT, "--full", "--json"
+        )
+        self.assertEqual(result["total_matches"], 1)
+        self.assertEqual(result["sessions"][0]["matches"][0]["role"], "toolResult")
+
+    def test_json_read_paginates_with_refs(self):
+        result = self.run_json(
+            "read", "pi:01a1ac0c/ac0c0003", "-B", "0", "-A", "0", "--json"
+        )
+        self.assertEqual(result["session"]["id"], OLD_ID)
+        self.assertEqual(result["session"]["cwd"], PROJECT)
+        self.assertEqual(len(result["messages"]), 1)
+        self.assertEqual(result["messages"][0]["id"], "ac0c0003")
+        self.assertEqual(
+            result["pagination"],
+            {
+                "total": 4,
+                "start": 2,
+                "end": 2,
+                "earlier_ref": "pi:01a1ac0c/ac0c0002",
+                "later_ref": "pi:01a1ac0c/ac0c0006",
+            },
+        )
+        result = self.run_json("read", "pi:01a1ac0c", "--json")
+        self.assertEqual(
+            result["pagination"],
+            {"total": 4, "start": 1, "end": 4, "earlier_ref": None, "later_ref": None},
+        )
+
+    def test_json_read_respects_full_view_and_hidden_anchor(self):
+        result = self.run_json(
+            "read", "pi:01a1ac0c/ac0c0004", "-B", "1", "-A", "0", "--json"
+        )
+        self.assertEqual(
+            [message["id"] for message in result["messages"]], ["ac0c0003", "ac0c0006"]
+        )
+        result = self.run_json("read", "pi:01a1ac0c", "--full", "--json")
+        self.assertEqual(result["pagination"]["total"], 7)
+        self.assertEqual(result["messages"][0]["role"], "system")
+        self.assertIn("(thinking)", result["messages"][2]["text"])
+        self.assertIn("(tool call: read)", result["messages"][3]["text"])
+
+    def test_json_read_respects_role_filter(self):
+        result = self.run_json(
+            "read", "pi:01a1ac0c", "--role", "user", "-A", "0", "--json"
+        )
+        self.assertEqual(result["pagination"]["total"], 2)
+        self.assertEqual(result["pagination"]["later_ref"], "pi:01a1ac0c/ac0c0007")
+        self.assertEqual([message["role"] for message in result["messages"]], ["user"])
+
+    def test_json_read_empty_page_after_hidden_message(self):
+        self.write_session(
+            PROJECT,
+            NEW_ID,
+            datetime(2026, 11, 11, 12, 14),
+            [
+                {"role": "user", "content": text("Hello")},
+                {"role": "system", "content": "Hidden"},
+            ],
+        )
+        result = self.run_json("read", "pi:01a1ca88-0/ca880002", "-B", "0", "--json")
+        self.assertEqual(result["messages"], [])
+        self.assertEqual(result["pagination"]["total"], 1)
+        self.assertIsNone(result["pagination"]["start"])
+        self.assertIsNone(result["pagination"]["end"])
+
+    def test_json_read_reports_truncation_without_text_hints(self):
+        result = self.run_json(
+            "read",
+            "pi:01a1ac0c/ac0c0002",
+            "-B",
+            "0",
+            "-A",
+            "0",
+            "--max-chars",
+            "12",
+            "--json",
+        )
+        message = result["messages"][0]
+        self.assertEqual(message["text"], QUESTION[:12])
+        self.assertTrue(message["truncated"])
+        self.assertEqual(message["total_chars"], len(QUESTION))
+        result = self.run_json(
+            "read",
+            "pi:01a1ac0c/ac0c0002",
+            "-B",
+            "0",
+            "-A",
+            "0",
+            "--max-chars",
+            "0",
+            "--json",
+        )
+        self.assertEqual(result["messages"][0]["text"], QUESTION)
+        self.assertFalse(result["messages"][0]["truncated"])
+
+    def test_json_messages_allow_missing_timestamps(self):
+        with patch.object(
+            cli,
+            "load_messages",
+            return_value=[Message("untimed", "user", (Part("text", "Hi"),))],
+        ):
+            result = self.run_json("read", "pi:01a1ac0c", "--json")
+        self.assertIsNone(result["messages"][0]["time"])
+
+    def test_json_output_from_every_source(self):
+        self.write_other_agents()
+        for source, session_id in (
+            ("pi", OLD_ID),
+            ("claude-code", CLAUDE_ID),
+            ("codex", CODEX_ID),
+            ("copilot", COPILOT_ID),
+        ):
+            with self.subTest(source=source):
+                result = self.run_json("read", f"{source}:{session_id}", "--json")
+                self.assertEqual(result["session"]["source"], source)
+                self.assertTrue(result["messages"])
+                self.assertTrue(all(message["id"] for message in result["messages"]))
+
+    def test_json_warnings_do_not_mix_with_output_or_leak_between_calls(self):
+        with self.old_path.open("a", encoding="utf-8") as transcript:
+            transcript.write("not json\n")
+        for command in (
+            ["read", "pi:01a1ac0c"],
+            ["search", "polars", "--project", PROJECT],
+        ):
+            with self.subTest(command=command):
+                result = self.run_json(*command, "--json")
+                self.assertEqual(len(result["warnings"]), 1)
+                self.assertIn("Invalid JSON", result["warnings"][0])
+                self.assertIn("(line skipped)", result["warnings"][0])
+        result = self.run_json("read", "pi:01a1ca88-0", "--json")
+        self.assertEqual(result["warnings"], [])
+
+    def test_json_command_errors(self):
+        for ref, message in (
+            ("pi:ffffffff", "no Pi session matches"),
+            ("pi:01a1ca88", "matches 2 sessions"),
+            ("pi:01a1ac0c/ffff", "no message ffff"),
+            ("pi:01a1ac0c/ac0c000", "matches 7 messages"),
+        ):
+            with self.subTest(ref=ref):
+                result = self.run_json("read", ref, "--json", expected_code=2)
+                self.assertEqual(result["error"]["type"], "command_error")
+                self.assertIn(message, result["error"]["message"])
+
+    def test_json_usage_errors(self):
+        for command in (
+            [],
+            ["serch", "polars"],
+            ["search"],
+            ["read"],
+            ["read", "invalid"],
+            ["sessions", "--limit", "0"],
+            ["sessions", "--source", "unknown"],
+            ["sessions", "--since", "yesterday"],
+            ["sessions", "--unexpected"],
+            ["sessions", "--format", "yaml"],
+            ["sessions", "--format"],
+            ["sessions", "--project", PROJECT, "--all-projects"],
+        ):
+            for flags in (["--json"], ["--format", "json"]):
+                for argv in (flags + command, command + flags):
+                    with self.subTest(argv=argv):
+                        result = self.run_json(*argv, expected_code=2)
+                        self.assertEqual(result["error"]["type"], "usage_error")
+                        self.assertTrue(result["error"]["message"])
+
+    def test_json_io_errors(self):
+        with patch.object(
+            cli, "load_messages", side_effect=PermissionError("Cannot read")
+        ):
+            result = self.run_json("read", "pi:01a1ac0c", "--json", expected_code=2)
+        self.assertEqual(
+            result["error"], {"type": "io_error", "message": "Cannot read"}
+        )
+
+    def test_json_option_after_separator_is_a_search_term(self):
+        code, stdout, stderr = self.run_cli("search", "--all-projects", "--", "--json")
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertTrue(stdout.startswith("No matches."))
+        result = self.run_json(
+            "--json", "search", "--all-projects", "--", "--format", "text"
+        )
+        self.assertEqual(result["total_matches"], 0)
+
     # sessions
 
     def test_sessions_lists_requests_newest_first(self):
@@ -570,14 +957,17 @@ class CommandTests(unittest.TestCase):
         self.write_other_agents()
         self.assert_output(
             ["read", "claude-code:7f3a"],
-            "claude-code:7f3a91c2 · /work/remember · 2026-11-09 10:00–10:05 · 3 messages\n"
+            "claude-code:7f3a91c2 · /work/remember · 2026-11-09 10:00–10:05 · 4 messages\n"
             "\n[user · claude-code:7f3a91c2/7f3a0001 · 10:01]\n"
             f"{fixtures.QUESTION}\n"
             "\n[assistant · claude-code:7f3a91c2/7f3a0002 · 10:02]\n"
             f"{fixtures.CHECKING}\n"
+            # A prompt queued while the agent worked.
+            "\n[user · claude-code:7f3a91c2/7f3a0105 · 10:04]\n"
+            f"{fixtures.QUEUED}\n"
             "\n[assistant · claude-code:7f3a91c2/7f3a0007 · 10:05]\n"
             f"{fixtures.ANSWER}\n"
-            "\nmessages 1–3 of 3\n",
+            "\nmessages 1–4 of 4\n",
         )
 
     def test_read_around_a_codex_message(self):
@@ -596,7 +986,7 @@ class CommandTests(unittest.TestCase):
         self.write_other_agents()
         code, stdout, _ = self.run_cli("read", "copilot:07b4f288", "--full")
         self.assertEqual(code, 0)
-        self.assertIn(" · 6 messages\n", stdout)
+        self.assertIn(" · 8 messages\n", stdout)
         self.assertIn(
             "\n[toolResult · copilot:07b4f288/07b40009 · 12:03]\n"
             f"(tool result: view)\n\n{fixtures.FILE_TEXT}\n",

@@ -3,6 +3,15 @@
 CLAUDE_CONFIG_DIR moves ~/.claude. Claude Code writes one record per content
 block, so one assistant reply can span several records that share a message
 ID; consecutive records of one reply are joined into one message.
+
+Besides user and assistant records, "attachment" records hold context that
+Claude Code adds: the system prompt ("prompt_snapshot"), files, reminders and
+hook messages. A prompt that the user queued while the agent worked is only
+saved as an attachment, so it becomes a user message. "system" records hold
+notices such as command output. Attachments and records without text, such
+as settings, token counts and API request copies, are left out. Subagent
+records ("isSidechain") are left out too: they are not part of the main
+conversation, and no saved session here has them to test against.
 """
 
 import os
@@ -32,6 +41,18 @@ CLAUDE_PROJECTS_DIR = (
 )
 # Records to read for the working directory and start time before giving up.
 HEADER_RECORDS = 200
+# Fields of an attachment that hold text for the conversation, in order.
+ATTACHMENT_TEXT_FIELDS = (
+    "filename",
+    "text",
+    "content",
+    "snippet",
+    "condition",
+    "addedBlocks",
+    "addedLines",
+    "files",
+)
+PROMPT_BOUNDARY = "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__"
 
 
 def get_project_from_path(path: str) -> str:
@@ -114,14 +135,24 @@ def _messages(path: Path, on_invalid: OnInvalid | None) -> Generator[Message]:
     tool_names: dict[str, str] = {}
     pending: Message | None = None
     pending_reply = None
+    # Context that arrives while a reply is written waits until the reply ends.
+    held: list[Message] = []
     with path.open(encoding="utf-8") as source:
-        for _, record in read_records(source, path, on_invalid):
+        for line_number, record in read_records(source, path, on_invalid):
+            if record.get("isSidechain"):
+                continue
             message = record.get("message")
-            if (
-                record.get("type") not in (USER, ASSISTANT)
-                or record.get("isSidechain")
-                or not isinstance(message, dict)
+            if record.get("type") not in (USER, ASSISTANT) or not isinstance(
+                message, dict
             ):
+                added = _added_message(record, line_number, tool_names)
+                if added is not None and pending_reply is not None:
+                    held.append(added)
+                elif added is not None:
+                    if pending is not None:
+                        yield pending
+                        pending = None
+                    yield added
                 continue
             parts = _parts(message.get("content"), tool_names)
             reply = message.get("id") if record["type"] == ASSISTANT else None
@@ -132,8 +163,10 @@ def _messages(path: Path, on_invalid: OnInvalid | None) -> Generator[Message]:
                 continue
             if pending is not None:
                 yield pending
+            yield from held
+            held = []
             pending = Message(
-                id=str(record.get("uuid", "")),
+                id=_record_id(record, line_number),
                 role=_role(record, parts),
                 parts=parts,
                 time=parse_timestamp(record.get("timestamp")),
@@ -141,6 +174,72 @@ def _messages(path: Path, on_invalid: OnInvalid | None) -> Generator[Message]:
             pending_reply = reply
     if pending is not None:
         yield pending
+    yield from held
+
+
+def _record_id(record: dict, line_number: int) -> str:
+    return str(record.get("uuid") or line_number)
+
+
+def _added_message(
+    record: dict, line_number: int, tool_names: dict[str, str]
+) -> Message | None:
+    """A message for an attachment or system record, or None without text."""
+    role, parts = SYSTEM, tuple[Part, ...]()
+    if record.get("type") == "system":
+        content = record.get("content")
+        if isinstance(content, str) and content.strip():
+            name = str(record.get("subtype") or "notice").replace("_", " ")
+            parts = (Part("context", content, name=name),)
+    elif record.get("type") == "attachment" and isinstance(
+        attachment := record.get("attachment"), dict
+    ):
+        kind = str(attachment.get("type") or "attachment")
+        if kind == "queued_command":
+            role, parts = USER, _parts(attachment.get("prompt"), tool_names)
+        elif kind == "prompt_snapshot":
+            prompt = _attachment_text(attachment.get("systemPrompt"))
+            parts = (Part("context", prompt, name="system prompt"),) if prompt else ()
+        else:
+            text = "\n\n".join(
+                text
+                for field in ATTACHMENT_TEXT_FIELDS
+                if (
+                    text := _attachment_text(
+                        attachment.get(field),
+                        "\n" if field == "addedLines" else "\n\n",
+                    )
+                )
+            )
+            if text:
+                parts = (Part("context", text, name=kind.replace("_", " ")),)
+    if not parts:
+        return None
+    return Message(
+        id=_record_id(record, line_number),
+        role=role,
+        parts=parts,
+        time=parse_timestamp(record.get("timestamp")),
+    )
+
+
+def _attachment_text(value: object, separator: str = "\n\n") -> str:
+    """The text in an attachment field: a string, file, block or list of them."""
+    if isinstance(value, str):
+        return "" if value == PROMPT_BOUNDARY else value.strip()
+    if isinstance(value, list):
+        return separator.join(
+            text for item in value if (text := _attachment_text(item))
+        )
+    if isinstance(value, dict):
+        # A file read: {"file": {"filePath", "content"}}; a text block:
+        # {"type": "text", "text"}; an instruction file: {"path", "content"}.
+        if isinstance(value.get("file"), dict):
+            return _attachment_text(value["file"].get("content"))
+        path = value.get("path")
+        text = _attachment_text(value.get("text") or value.get("content"))
+        return f"{path}\n{text}" if isinstance(path, str) and text else text
+    return ""
 
 
 def _role(record: dict, parts: tuple[Part, ...]) -> str:

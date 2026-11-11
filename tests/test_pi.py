@@ -295,6 +295,96 @@ class GetMessageTextTests(unittest.TestCase):
         )
         self.assertEqual(pi.get_message_text({'role': 'user'}), '')
 
+    def test_system_prompts_are_saved_in_sections(self):
+        message = {
+            'role': 'system',
+            'content': '',
+            'sections': {
+                'preamble': 'You are pi.',
+                'memory': None,
+                'cwd': '<cwd>\n/work\n</cwd>',
+            },
+        }
+        self.assertEqual(pi.get_message_text(message), '')
+        self.assertEqual(
+            pi.get_message_text(message, full=True),
+            '(system prompt) You are pi.\n\n<cwd>\n/work\n</cwd>',
+        )
+
+    def test_commands_the_user_ran(self):
+        message = {
+            'role': 'bashExecution',
+            'command': 'wit skill load',
+            'output': 'wit: command not found\n',
+            'exitCode': 127,
+            'cancelled': False,
+        }
+        self.assertEqual(
+            pi.get_message_text(message),
+            '$ wit skill load\n\nwit: command not found\n\n(exit code 127)',
+        )
+        message.update(output='', exitCode=None, cancelled=True)
+        self.assertEqual(pi.get_message_text(message), '$ wit skill load\n\n(cancelled)')
+
+
+class ReadMessagesTests(unittest.TestCase):
+    """read_messages shows every event that holds text, in order."""
+
+    def setUp(self):
+        temporary_directory = TemporaryDirectory()
+        self.addCleanup(temporary_directory.cleanup)
+        root = Path(temporary_directory.name)
+        patcher = patch.object(pi, 'PI_SESSIONS_DIR', root)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        path = root / '--work--' / '2026-11-09T10-00-00-000Z_s1.jsonl'
+        path.parent.mkdir()
+        events = [
+            {'type': 'session', 'id': 's1', 'cwd': '/work', 'timestamp': '2026-11-09T10:00:00Z'},
+            {'type': 'model_change', 'id': 'e1', 'provider': 'anthropic', 'modelId': 'm'},
+            {
+                'type': 'custom_message',
+                'id': 'e2',
+                'customType': 'pi-memory/recall',
+                'content': '<memory_recall>Use uv.</memory_recall>',
+                'display': True,
+            },
+            {'type': 'message', 'id': 'e3', 'message': {'role': 'user', 'content': 'Hi'}},
+            {'type': 'custom', 'id': 'e4', 'customType': 'state', 'data': {'n': 1}},
+            {
+                'type': 'compaction',
+                'id': 'e5',
+                'summary': '## Goal\nSay hi.',
+                'systemMessage': {
+                    'role': 'system',
+                    'content': '',
+                    'sections': {'preamble': 'You are pi.'},
+                },
+            },
+            {'type': 'branch_summary', 'id': 'e6', 'summary': 'Tried another way.'},
+            {'type': 'label', 'id': 'e7', 'targetId': 'e3', 'label': 'start'},
+        ]
+        path.write_text(''.join(json.dumps(event) + '\n' for event in events))
+        self.session = pi.get_session('s1')
+
+    def test_context_events_are_system_messages(self):
+        messages = pi.read_messages(self.session)
+        self.assertEqual(
+            [(message.id, message.role, message.text(full=True)) for message in messages],
+            [
+                ('e2', 'system', '(pi-memory/recall) <memory_recall>Use uv.</memory_recall>'),
+                ('e3', 'user', 'Hi'),
+                (
+                    'e5',
+                    'system',
+                    '(compaction summary) ## Goal\nSay hi.\n\n(system prompt) You are pi.',
+                ),
+                ('e6', 'system', '(branch summary) Tried another way.'),
+            ],
+        )
+        # Context is only shown in full.
+        self.assertEqual([message.text() for message in messages], ['', 'Hi', '', ''])
+
 
 if __name__ == '__main__':
     unittest.main()

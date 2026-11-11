@@ -3,17 +3,18 @@ CLI entrypoint
 """
 
 import argparse
+import json
 import os
 import re
 import sys
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
 from .transcripts import SOURCES as TRANSCRIPT_SOURCES
 from .transcripts.base import Message as SourceMessage
-from .transcripts.base import SessionInfo, TranscriptSource, ignore_invalid
+from .transcripts.base import OnInvalid, SessionInfo, TranscriptSource, ignore_invalid
 
 SOURCES = tuple(TRANSCRIPT_SOURCES)
 ROLES = ("user", "assistant")
@@ -96,14 +97,38 @@ def non_negative_int(value: str) -> int:
     return parse_count(value, 0)
 
 
-def build_parser() -> argparse.ArgumentParser:
+def add_output_options(
+    parser: argparse.ArgumentParser, *, default: str = argparse.SUPPRESS
+) -> None:
+    output = parser.add_argument_group("output")
+    output.add_argument(
+        "--format",
+        choices=("text", "json"),
+        default=default,
+        help="output format (default: text)",
+    )
+    output.add_argument(
+        "--json",
+        dest="format",
+        action="store_const",
+        const="json",
+        default=argparse.SUPPRESS,
+        help="machine-readable JSON (same as --format json)",
+    )
+
+
+def build_parser(*, exit_on_error: bool = True) -> argparse.ArgumentParser:
+    parser_options = {**PARSER_OPTIONS, "exit_on_error": exit_on_error}
     parser = argparse.ArgumentParser(
         prog="remember",
         description="Find and read messages from past coding-agent sessions.",
         epilog=REFS_HELP,
         color=False,
-        **PARSER_OPTIONS,
+        **parser_options,
     )
+    add_output_options(parser, default="text")
+    output = argparse.ArgumentParser(add_help=False)
+    add_output_options(output)
     commands = parser.add_subparsers(
         title="commands", dest="command", metavar="COMMAND", required=True
     )
@@ -153,19 +178,23 @@ def build_parser() -> argparse.ArgumentParser:
     view.add_argument(
         "--full",
         action="store_true",
-        help="also show thinking, tool calls, tool results and system prompts",
+        help=(
+            "show everything the transcript holds as text: also thinking, "
+            "tool calls, tool results, system prompts, and context and "
+            "notices that the agent added"
+        ),
     )
 
     search = commands.add_parser(
         "search",
-        parents=[view, scope],
+        parents=[view, scope, output],
         help="find messages containing all terms, grouped by session",
         description=(
             "Find messages containing all terms (case-insensitive), "
             "grouped by session, newest first."
         ),
         epilog=REFS_HELP,
-        **PARSER_OPTIONS,
+        **parser_options,
     )
     search.add_argument(
         "terms",
@@ -184,14 +213,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     sessions = commands.add_parser(
         "sessions",
-        parents=[scope],
+        parents=[scope, output],
         help="list sessions by latest activity",
         description=(
             "List sessions by latest activity, newest first, "
             "each with its opening request."
         ),
         epilog=REFS_HELP,
-        **PARSER_OPTIONS,
+        **parser_options,
     )
     sessions.add_argument(
         "--limit",
@@ -203,13 +232,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     read = commands.add_parser(
         "read",
-        parents=[view],
+        parents=[view, output],
         help="read a session, or the messages around one message",
         description=(
             "Read a session from the start, or the messages around one message."
         ),
         epilog=REFS_HELP,
-        **PARSER_OPTIONS,
+        **parser_options,
     )
     read.add_argument(
         "ref", type=parse_ref, metavar="REF", help="session or message ref"
@@ -271,14 +300,37 @@ class Message:
     # Index among all of the session's messages, so windows can anchor on
     # messages that the current view hides.
     position: int
+    id: str
     ref: str
     role: str
     time: datetime | None
     text: str
 
 
-def warn_invalid(error: ValueError) -> None:
-    print(f"remember: warning: {error} (line skipped)", file=sys.stderr)
+@dataclass
+class Output:
+    json_enabled: bool = False
+    warnings: list[str] = field(default_factory=list)
+
+    def write_json(self, data: dict) -> None:
+        print(
+            json.dumps(
+                {**data, "warnings": self.warnings}, ensure_ascii=False, indent=2
+            )
+        )
+
+    def warn_invalid(self, error: ValueError) -> None:
+        warning = f"{error} (line skipped)"
+        if self.json_enabled:
+            self.warnings.append(warning)
+        else:
+            print(f"remember: warning: {warning}", file=sys.stderr)
+
+    def error(self, kind: str, error: Exception) -> None:
+        if self.json_enabled:
+            self.write_json({"error": {"type": kind, "message": str(error)}})
+        else:
+            print(f"remember: {error}", file=sys.stderr)
 
 
 def source_of(session: Session) -> TranscriptSource:
@@ -391,8 +443,8 @@ def resolve_message(
     return matches[0]
 
 
-def load_messages(session: Session) -> list[SourceMessage]:
-    return source_of(session).read_messages(session.info, on_invalid=warn_invalid)
+def load_messages(session: Session, on_invalid: OnInvalid) -> list[SourceMessage]:
+    return source_of(session).read_messages(session.info, on_invalid=on_invalid)
 
 
 def view_messages(
@@ -416,6 +468,7 @@ def view_messages(
         shown.append(
             Message(
                 position=position,
+                id=message.id,
                 ref=f"{session.ref}/{shorts[message.id]}",
                 role=message.role,
                 time=message.time,
@@ -500,7 +553,30 @@ def view_flags(args: argparse.Namespace) -> str:
     return "".join(flags)
 
 
-def run_sessions(args: argparse.Namespace) -> int:
+def session_json(session: Session) -> dict:
+    return {
+        "ref": session.ref,
+        "id": session.info.id,
+        "source": session.source,
+        "cwd": session.cwd,
+        "start": session.start.isoformat(),
+        "end": session.end.isoformat(),
+    }
+
+
+def message_json(message: Message, max_chars: int = 0) -> dict:
+    return {
+        "ref": message.ref,
+        "id": message.id,
+        "role": message.role,
+        "time": message.time.isoformat() if message.time is not None else None,
+        "text": message.text[:max_chars] if max_chars else message.text,
+        "truncated": bool(max_chars and len(message.text) > max_chars),
+        "total_chars": len(message.text),
+    }
+
+
+def run_sessions(args: argparse.Namespace, output: Output) -> int:
     listed = []
     for session in find_sessions(args):
         try:
@@ -512,6 +588,18 @@ def run_sessions(args: argparse.Namespace) -> int:
         # Sessions without a request have nothing to recall.
         if (request := opening_request(first_user_messages)) is not None:
             listed.append((session, request))
+    if output.json_enabled:
+        output.write_json(
+            {
+                "sessions": [
+                    {**session_json(session), "request": request}
+                    for session, request in listed[: args.limit]
+                ],
+                "total": len(listed),
+                "limit": args.limit,
+            }
+        )
+        return 0
     if not listed:
         print(no_results("sessions", args, []))
         return 0
@@ -525,12 +613,12 @@ def run_sessions(args: argparse.Namespace) -> int:
     return 0
 
 
-def run_search(args: argparse.Namespace) -> int:
+def run_search(args: argparse.Namespace, output: Output) -> int:
     terms = [one_line(term).casefold() for term in args.terms]
     results = []
     for session in find_sessions(args):
         try:
-            messages = load_messages(session)
+            messages = load_messages(session, output.warn_invalid)
         except OSError:
             continue  # Removed after it was listed.
         matches = [
@@ -541,6 +629,30 @@ def run_search(args: argparse.Namespace) -> int:
         if matches:
             results.append((session, opening_request(messages) or "", matches))
     total = sum(len(matches) for _, _, matches in results)
+    if output.json_enabled:
+        sessions = []
+        remaining = args.limit
+        for session, request, matches in results:
+            if not remaining:
+                break
+            selected = matches[:remaining]
+            sessions.append(
+                {
+                    **session_json(session),
+                    "request": request,
+                    "matches": [message_json(message) for message in selected],
+                }
+            )
+            remaining -= len(selected)
+        output.write_json(
+            {
+                "sessions": sessions,
+                "total_matches": total,
+                "total_sessions": len(results),
+                "limit": args.limit,
+            }
+        )
+        return 0
     if not total:
         options = ["fewer terms"] + ([] if args.full else ["--full"])
         print(no_results("matches", args, options))
@@ -570,10 +682,10 @@ def run_search(args: argparse.Namespace) -> int:
     return 0
 
 
-def run_read(args: argparse.Namespace) -> int:
+def run_read(args: argparse.Namespace, output: Output) -> int:
     source_name, session_prefix, message_prefix = args.ref
     session = resolve_session(source_name, session_prefix)
-    all_messages = load_messages(session)
+    all_messages = load_messages(session, output.warn_invalid)
     messages = view_messages(session, all_messages, args)
     if message_prefix is None:
         shown = messages[: args.after + 1]
@@ -584,6 +696,29 @@ def run_read(args: argparse.Namespace) -> int:
         shown = earlier[-args.before :] if args.before else []
         shown += later[: args.after + 1]
 
+    if output.json_enabled:
+        first = messages.index(shown[0]) if shown else None
+        last = messages.index(shown[-1]) if shown else None
+        output.write_json(
+            {
+                "session": session_json(session),
+                "messages": [
+                    message_json(message, args.max_chars) for message in shown
+                ],
+                "pagination": {
+                    "total": len(messages),
+                    "start": first + 1 if first is not None else None,
+                    "end": last + 1 if last is not None else None,
+                    "earlier_ref": messages[first - 1].ref if first else None,
+                    "later_ref": (
+                        messages[last + 1].ref
+                        if last is not None and last < len(messages) - 1
+                        else None
+                    ),
+                },
+            }
+        )
+        return 0
     count = plural(len(messages), "message")
     print(" · ".join([session.ref, session.cwd, format_span(session), count]))
     for message in shown:
@@ -623,12 +758,42 @@ def run_read(args: argparse.Namespace) -> int:
 COMMANDS = {"search": run_search, "sessions": run_sessions, "read": run_read}
 
 
+def wants_json(argv: Sequence[str]) -> bool:
+    """Find the output mode even when another argument fails validation.
+
+    The last valid output option wins; -- ends option parsing. Invalid
+    formats do not hide a JSON request when reporting a usage error.
+    """
+    output_format = "text"
+    for index, option in enumerate(argv):
+        if option == "--":
+            break
+        if option == "--json":
+            output_format = "json"
+        elif option == "--format" and index + 1 < len(argv):
+            if argv[index + 1] in ("text", "json"):
+                output_format = argv[index + 1]
+        elif option in ("--format=text", "--format=json"):
+            output_format = option.partition("=")[2]
+    return output_format == "json"
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    argv = list(sys.argv[1:] if argv is None else argv)
+    output = Output(json_enabled=wants_json(argv))
     try:
-        return COMMANDS[args.command](args)
+        args = build_parser(exit_on_error=not output.json_enabled).parse_args(argv)
+    except argparse.ArgumentError as error:
+        output.error("usage_error", error)
+        return 2
+    output.json_enabled = args.format == "json"
+    try:
+        return COMMANDS[args.command](args, output)
     except CommandError as error:
-        print(f"remember: {error}", file=sys.stderr)
+        output.error("command_error", error)
+        return 2
+    except OSError as error:
+        output.error("io_error", error)
         return 2
 
 

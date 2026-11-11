@@ -60,6 +60,8 @@ class RenderTests(unittest.TestCase):
         Part("image"),
         Part("redacted_thinking"),
         Part("text", "   "),
+        Part("context", " You are an agent. ", name="system prompt"),
+        Part("thinking"),
     )
 
     def test_default_shows_text_and_images_only(self):
@@ -70,7 +72,9 @@ class RenderTests(unittest.TestCase):
             render(self.parts, full=True),
             "(tool result: bash, error)\n\n(thinking) Plan it.\n\nDone.\n\n"
             '(tool call: read) {"path": "café.py"}\n\n'
-            "(tool call: apply_patch) *** Begin Patch\n\n(image)\n\n(redacted_thinking)",
+            "(tool call: apply_patch) *** Begin Patch\n\n(image)\n\n(redacted_thinking)"
+            # Context names what it is; thinking without text still shows.
+            "\n\n(system prompt) You are an agent.\n\n(thinking)",
         )
 
 

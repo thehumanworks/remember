@@ -2,9 +2,12 @@
 
 CODEX_HOME moves ~/.codex. Archived sessions in archived_sessions are included.
 Each line is {"timestamp", "type", "payload"}. The conversation is in the
-"response_item" lines; "event_msg" lines repeat it for the user interface and
-are skipped. Response items have no stable ID, so a message's ID is its line
-number, which does not change because rollouts are only appended to.
+"response_item" lines. The first line, "session_meta", holds the system
+prompt ("base_instructions"), and "compacted" lines hold compaction
+summaries. "event_msg" lines repeat the conversation for the user interface,
+and "turn_context" lines repeat settings and instructions, so both are left
+out. Response items have no stable ID, so a message's ID is its line number,
+which does not change because rollouts are only appended to.
 """
 
 import os
@@ -137,9 +140,17 @@ def _messages(path: Path, on_invalid: OnInvalid | None) -> Generator[Message]:
     with path.open(encoding="utf-8") as source:
         for line_number, record in read_records(source, path, on_invalid):
             item = record.get("payload")
-            if record.get("type") != "response_item" or not isinstance(item, dict):
+            if not isinstance(item, dict):
                 continue
-            message = _message(item, tool_names)
+            match record.get("type"):
+                case "response_item":
+                    message = _message(item, tool_names)
+                case "session_meta":
+                    message = _context(item.get("base_instructions"), "system prompt")
+                case "compacted":
+                    message = _context(item.get("message"), "compaction summary")
+                case _:
+                    message = None
             if message is not None:
                 role, parts = message
                 yield Message(
@@ -170,8 +181,9 @@ def _message(
             for entry in item.get(key) or []
             if isinstance(entry, dict)
         ]
+        # Reasoning that is only saved encrypted still shows that it happened.
         text = "\n\n".join(text for text in texts if text.strip())
-        return ASSISTANT, ((Part("thinking", text),) if text else ())
+        return ASSISTANT, (Part("thinking", text),)
     if isinstance(item_type, str) and item_type in TOOL_CALLS:
         name = FIXED_TOOL_NAMES.get(item_type) or str(item.get("name"))
         tool_names[str(item.get("call_id"))] = name
@@ -183,6 +195,15 @@ def _message(
         header = Part("tool_result", name=str(name), is_error=is_error)
         return TOOL_RESULT, (header, *parts)
     return None
+
+
+def _context(text: object, name: str) -> tuple[str, tuple[Part, ...]] | None:
+    # Base instructions are saved as {"text": ...}; older rollouts use a string.
+    if isinstance(text, dict):
+        text = text.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return None
+    return SYSTEM, (Part("context", text, name=name),)
 
 
 def _is_context(parts: tuple[Part, ...]) -> bool:

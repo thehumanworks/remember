@@ -17,6 +17,11 @@ THINKING = "Look at flake.nix."
 CHECKING = "Checking flake.nix."
 FILE_TEXT = "{ outputs = { ... }; }"
 ANSWER = "The flake check fails because nixpkgs is not pinned."
+# Context that the agents add, which only the full view shows.
+SYSTEM_PROMPT = "You are a coding agent."
+SUMMARY = "## Goal\nFix the flake check."
+# A prompt that the user queued while the agent worked (Claude Code).
+QUEUED = "Also check the lock file."
 
 
 def stamp(start: datetime, minutes: int) -> str:
@@ -67,12 +72,39 @@ def claude_session(root: Path, cwd: str, session_id: str, start: datetime) -> Pa
             "content": [block],
         }
 
+    def added(kind: str, number: int, minute: int, **fields) -> dict:
+        # Attachment and system records number from 101, after the messages.
+        return {
+            "type": kind,
+            "cwd": cwd,
+            "sessionId": session_id,
+            "uuid": uuid(prefix, number),
+            "timestamp": stamp(start, minute),
+            **fields,
+        }
+
     records = [
         {
             "type": "queue-operation",
             "operation": "enqueue",
             "timestamp": stamp(start, 0),
         },
+        added(
+            "attachment",
+            101,
+            1,
+            attachment={
+                "type": "prompt_snapshot",
+                "systemPrompt": [SYSTEM_PROMPT, "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__"],
+            },
+        ),
+        # Metadata only: left out.
+        added(
+            "attachment",
+            102,
+            1,
+            attachment={"type": "credential_org", "organizationUuid": "0"},
+        ),
         record("user", 1, 1, {"role": "user", "content": QUESTION}),
         # One reply, saved as one record per content block.
         record(
@@ -80,6 +112,16 @@ def claude_session(root: Path, cwd: str, session_id: str, start: datetime) -> Pa
             2,
             2,
             reply("msg_1", {"type": "thinking", "thinking": THINKING}),
+        ),
+        # Added while the reply is written: shown after it.
+        added(
+            "attachment",
+            103,
+            2,
+            attachment={
+                "type": "total_tokens_reminder",
+                "text": "<total_tokens>9000</total_tokens>",
+            },
         ),
         record("assistant", 3, 2, reply("msg_1", {"type": "text", "text": CHECKING})),
         record(
@@ -113,6 +155,13 @@ def claude_session(root: Path, cwd: str, session_id: str, start: datetime) -> Pa
             toolUseResult={"type": "text", "file": {"filePath": "flake.nix"}},
         ),
         {"type": "attachment", "timestamp": stamp(start, 3), "cwd": cwd},
+        added(
+            "system",
+            104,
+            3,
+            subtype="local_command",
+            content="<local-command-stdout>Reloaded</local-command-stdout>",
+        ),
         record(
             "user",
             6,
@@ -123,8 +172,19 @@ def claude_session(root: Path, cwd: str, session_id: str, start: datetime) -> Pa
             },
             isMeta=True,
         ),
+        added(
+            "attachment",
+            105,
+            4,
+            attachment={
+                "type": "queued_command",
+                "prompt": [{"type": "text", "text": QUEUED}],
+                "commandMode": "prompt",
+            },
+        ),
         record("assistant", 7, 5, reply("msg_2", {"type": "text", "text": ANSWER})),
-        {"type": "system", "subtype": "turn_duration", "timestamp": stamp(start, 5)},
+        # Metadata only: left out.
+        added("system", 106, 5, subtype="turn_duration", durationMs=300000),
     ]
     path = root / re.sub(r"[^A-Za-z0-9]", "-", cwd) / f"{session_id}.jsonl"
     return write_jsonl(path, records, stamp(start, 5))
@@ -156,6 +216,7 @@ def codex_session(
                 "originator": "codex_cli_rs",
                 "cli_version": "0.95.0",
                 "source": "cli",
+                "base_instructions": {"text": SYSTEM_PROMPT},
             },
         ),
         line("response_item", 0, message("developer", "<permissions instructions>")),
@@ -206,6 +267,23 @@ def codex_session(
         ),
         line("response_item", 4, message("assistant", ANSWER, "output_text")),
         line("event_msg", 4, {"type": "agent_message", "message": ANSWER}),
+        # Reasoning saved only in encrypted form.
+        line(
+            "response_item",
+            4,
+            {
+                "type": "reasoning",
+                "summary": [],
+                "content": None,
+                "encrypted_content": "gAAAA",
+            },
+        ),
+        # The history that replaces the old one repeats messages: left out.
+        line(
+            "compacted",
+            4,
+            {"message": SUMMARY, "replacement_history": [message("user", QUESTION)]},
+        ),
     ]
     when = start.replace(tzinfo=UTC)
     path = (
@@ -256,7 +334,7 @@ def copilot_session(root: Path, cwd: str, session_id: str, start: datetime) -> P
         event(
             "system.message",
             1,
-            {"role": "system", "content": "You are the GitHub Copilot CLI."},
+            {"role": "system", "content": SYSTEM_PROMPT},
         ),
         event("assistant.turn_start", 1, {"turnId": "0"}),
         event("assistant.reasoning", 2, {"reasoningId": "r1", "content": THINKING}),
@@ -266,6 +344,8 @@ def copilot_session(root: Path, cwd: str, session_id: str, start: datetime) -> P
             {
                 "messageId": "m1",
                 "content": CHECKING,
+                # Repeats the reasoning event above: shown once.
+                "reasoningText": THINKING,
                 "toolRequests": [
                     {
                         "toolCallId": "tc_1",
@@ -294,6 +374,15 @@ def copilot_session(root: Path, cwd: str, session_id: str, start: datetime) -> P
             4,
             {"messageId": "m2", "content": ANSWER, "toolRequests": []},
         ),
+        # A streaming fragment and usage data: left out.
+        event("assistant.message_delta", 4, {"messageId": "m2", "deltaContent": "The"}),
+        event("session.usage_checkpoint", 4, {"totalPremiumRequests": 1}),
+        event(
+            "session.compaction_complete",
+            4,
+            {"success": True, "summaryContent": SUMMARY},
+        ),
+        event("skill.invoked", 4, {"name": "nix", "content": "Use nix flake check."}),
         event("session.shutdown", 4, {"shutdownType": "routine"}),
     ]
     directory = root / session_id

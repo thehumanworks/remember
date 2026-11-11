@@ -10,6 +10,8 @@ from fixtures import (
     ANSWER,
     FILE_TEXT,
     QUESTION,
+    SUMMARY,
+    SYSTEM_PROMPT,
     THINKING,
     codex_session,
     stamp,
@@ -77,6 +79,7 @@ class CodexTests(unittest.TestCase):
         self.assertEqual(
             [(message.id, message.role) for message in messages],
             [
+                ("1", "system"),
                 ("2", "system"),
                 ("3", "system"),
                 ("4", "system"),
@@ -85,22 +88,33 @@ class CodexTests(unittest.TestCase):
                 ("9", "assistant"),
                 ("10", "toolResult"),
                 ("11", "assistant"),
+                ("13", "assistant"),
+                ("14", "system"),
             ],
         )
         self.assertEqual(
             [message.text() for message in messages if message.role == "user"],
             [QUESTION],
         )
+        self.assertEqual(messages[4].time, datetime(2026, 11, 9, 10, 1, tzinfo=UTC))
+
+    def test_full_view_shows_every_record_with_text(self):
+        messages = self.messages()
         self.assertEqual(
-            [message.text(full=True) for message in messages[4:]],
+            [message.text(full=True) for message in messages[:1] + messages[5:]],
             [
+                f"(system prompt) {SYSTEM_PROMPT}",
                 f"(thinking) {THINKING}",
                 '(tool call: shell) {"command": ["cat", "flake.nix"]}',
                 f"(tool result: shell)\n\n{FILE_TEXT}",
                 ANSWER,
+                # Encrypted reasoning still shows that it happened.
+                "(thinking)",
+                f"(compaction summary) {SUMMARY}",
             ],
         )
-        self.assertEqual(messages[3].time, datetime(2026, 11, 9, 10, 1, tzinfo=UTC))
+        # Context is only shown in full.
+        self.assertEqual([m.text() for m in messages[:1] + messages[-2:]], ["", "", ""])
 
     def test_tool_output_forms(self):
         for output, expected in (
