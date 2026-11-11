@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Tool caches
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environments
+.venv/
+.env
+.direnv/
+
+# Nix build output
+result
+result-*
+
+# Agent worktrees
+.pi/worktrees
+.claude/worktrees
